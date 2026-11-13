@@ -1,33 +1,28 @@
-# hive-skills
+# hafsql-hive
 
-Claude Code skills for building on the Hive blockchain.
+A Claude Code skill for building correct, performant queries against **HafSQL** — the PostgreSQL layer over HAF-indexed Hive blockchain data.
 
 ## Install
 
 ```bash
-npx skills add rantree-hive/hive-skills
+npx skills add rantree-hive/hafsql-hive
 ```
 
-## Skills
+## What it covers
 
-### `hafsql-hive`
-
-Build correct, performant queries against **HafSQL** — the PostgreSQL layer over HAF-indexed Hive blockchain data.
-
-Covers:
-- Which HafSQL table to query for each operation type (virtual vs non-virtual ops)
-- Multi-window aggregation pattern with `id_from_timestamp`
-- VESTS → HP conversion
-- Vote value / rshares formula (and the common scaling bug that gives $0.00)
-- RC% calculation from `rc_api`
-- Hive API response parsing (`parseAmt` with precision handling)
+- Which HafSQL table to use for each operation type — including the **virtual-op trap** (`haf_operations` silently returns 0 rows for reward ops)
+- Multi-window aggregation with `id_from_timestamp` (30d / 7d / all-time in one query)
+- VESTS → HP conversion via `hafsql.dynamic_global_properties.vests_per_hive`
+- Vote value / rshares formula — the `* 1_000_000 / 100` scaling factor that prevents `$0.00` values
+- RC% calculation from `rc_api.find_rc_accounts`
+- Precision-aware `parseAmt` for both old string and new asset-object API formats
 - Pitfalls checklist
 
 ## Usage
 
-Once installed, Claude will automatically apply these patterns when writing backend code that queries HafSQL or calls `condenser_api` / `rc_api`.
+Once installed, Claude applies these patterns automatically when writing backend code that queries HafSQL or calls `condenser_api` / `rc_api`.
 
-You can also trigger it explicitly:
+Trigger explicitly:
 
 ```
 /hafsql-hive
