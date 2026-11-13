@@ -12,6 +12,52 @@ description: >
 
 # HafSQL × Hive — Query & API Skill
 
+## 0  Connecting to the public HafSQL instance
+
+A read-only public instance is maintained by @mahdiyari. Use it to test queries
+or as the data source for Hive applications without running your own HAF node.
+
+```
+Host:     hafsql-sql.mahdiyari.info
+Port:     5432
+Database: haf_block_log
+User:     hafsql_public
+Password: hafsql_public
+SSL:      false (not required)
+```
+
+**psql one-liner:**
+```bash
+psql "host=hafsql-sql.mahdiyari.info port=5432 dbname=haf_block_log user=hafsql_public password=hafsql_public sslmode=disable"
+```
+
+**Node.js (pg):**
+```js
+const { Pool } = require('pg');
+const pool = new Pool({
+  host:     'hafsql-sql.mahdiyari.info',
+  port:     5432,
+  database: 'haf_block_log',
+  user:     'hafsql_public',
+  password: 'hafsql_public',
+  ssl:      false,
+});
+```
+
+**Environment variables (.env):**
+```
+HAFSQL_HOST=hafsql-sql.mahdiyari.info
+HAFSQL_PORT=5432
+HAFSQL_DB=haf_block_log
+HAFSQL_USER=hafsql_public
+HAFSQL_PASSWORD=hafsql_public
+HAFSQL_SSL=false
+```
+
+> This is a shared public node — avoid full-table scans and always use
+> `id_from_timestamp` / indexed filters (see §3). Cache results on your side.
+
+
 ## 1  Schema map — which table does what
 
 HafSQL has two layers. Always prefer the **dedicated operation tables** (layer 2) over the generic views (layer 1) for any operation-specific work.
