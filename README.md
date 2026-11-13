@@ -24,6 +24,17 @@ npx skills add rantree-hive/hafsql-hive
 - Precision-aware `parseAmt` for both old string and new asset-object API formats
 - Pitfalls checklist
 
+## Public instance
+
+A read-only public HafSQL instance is available for development and testing:
+
+```
+host=hafsql-sql.mahdiyari.info  port=5432  dbname=haf_block_log
+user=hafsql_public  password=hafsql_public  sslmode=disable
+```
+
+Maintained by @mahdiyari. Use indexed queries and cache results — it's a shared node.
+
 ## Usage
 
 Once installed, Claude applies these patterns automatically when writing backend code that queries HafSQL or calls `condenser_api` / `rc_api`.
