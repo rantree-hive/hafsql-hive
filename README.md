@@ -30,6 +30,12 @@ npx skills add rantree-hive/hafsql-hive
 - `haf_operations.body` wrapping on HAFAH nodes (`body?.value`)
 - `hafsql.comments` payout columns: `SPLIT_PART` string format, tags JSONB filter, active vs. paid-out detection, sub-account `LIKE` pattern
 - Production pool setup with circuit breaker, retry, and `statement_timeout`
+- Correct `custom_json` column (`json` text → `hafsql.to_json(json)`) and op-type registry names
+- **Comment edits are separate ops**: `DISTINCT ON` dedup in `operation_comment_view`, stale `hafsql.comments.body`, bounding comment scans by `created`
+- DHF / proposal payouts via `operation_proposal_pay_table` (a virtual op, not a transfer)
+- Post community/category resolution through hivemind joins, plus snap/microblog community IDs
+- Index cheat-sheet: which filters hit an index on transfers, votes, `hafd.account_operations`, and `hafd.operations`
+- Dashboard query patterns: `SUM() OVER()` totals before `LIMIT`, per-account bounds with `unnest`, chunked scans, memo matching, new-account discovery
 - Pitfalls checklist
 
 ## Public instance
