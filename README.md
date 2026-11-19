@@ -22,6 +22,14 @@ npx skills add rantree-hive/hafsql-hive
 - `hive_accounts_info_view.post_count` includes comments — use `hafsql.comments WHERE parent_author=''` for root-only count
 - Profile metadata from `hivemind_app.hive_accounts_info_view.posting_json_metadata`
 - Precision-aware `parseAmt` for both old string and new asset-object API formats
+- Schema layers: hafd layer-0 raw tables, generic views, dedicated op tables, and the `op_type` name format
+- Per-voter parallel scan for vote queries over many accounts (avoids slow bitmap scans on `voter = ANY(...)`)
+- Vote value from actual rshares via `hivemind_app.hive_votes_view`
+- **milli-VESTS scaling** in `hafsql.balances.vests` and `hafsql.accounts.incoming_vests` / `outgoing_vests`
+- Operation timeline with `haf_account_operations` cursor pagination, plus reading `custom_json` via the hafd account-operation index
+- `haf_operations.body` wrapping on HAFAH nodes (`body?.value`)
+- `hafsql.comments` payout columns: `SPLIT_PART` string format, tags JSONB filter, active vs. paid-out detection, sub-account `LIKE` pattern
+- Production pool setup with circuit breaker, retry, and `statement_timeout`
 - Pitfalls checklist
 
 ## Public instance
