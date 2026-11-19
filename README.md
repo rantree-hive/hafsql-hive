@@ -22,6 +22,20 @@ npx skills add rantree-hive/hafsql-hive
 - `hive_accounts_info_view.post_count` includes comments — use `hafsql.comments WHERE parent_author=''` for root-only count
 - Profile metadata from `hivemind_app.hive_accounts_info_view.posting_json_metadata`
 - Precision-aware `parseAmt` for both old string and new asset-object API formats
+- Schema layers: hafd layer-0 raw tables, generic views, dedicated op tables, and the `op_type` name format
+- Per-voter parallel scan for vote queries over many accounts (avoids slow bitmap scans on `voter = ANY(...)`)
+- Vote value from actual rshares via `hivemind_app.hive_votes_view`
+- **milli-VESTS scaling** in `hafsql.balances.vests` and `hafsql.accounts.incoming_vests` / `outgoing_vests`
+- Operation timeline with `haf_account_operations` cursor pagination, plus reading `custom_json` via the hafd account-operation index
+- `haf_operations.body` wrapping on HAFAH nodes (`body?.value`)
+- `hafsql.comments` payout columns: `SPLIT_PART` string format, tags JSONB filter, active vs. paid-out detection, sub-account `LIKE` pattern
+- Production pool setup with circuit breaker, retry, and `statement_timeout`
+- Correct `custom_json` column (`json` text → `hafsql.to_json(json)`) and op-type registry names
+- **Comment edits are separate ops**: `DISTINCT ON` dedup in `operation_comment_view`, stale `hafsql.comments.body`, bounding comment scans by `created`
+- DHF / proposal payouts via `operation_proposal_pay_table` (a virtual op, not a transfer)
+- Post community/category resolution through hivemind joins, plus snap/microblog community IDs
+- Index cheat-sheet: which filters hit an index on transfers, votes, `hafd.account_operations`, and `hafd.operations`
+- Dashboard query patterns: `SUM() OVER()` totals before `LIMIT`, per-account bounds with `unnest`, chunked scans, memo matching, new-account discovery
 - Pitfalls checklist
 
 ## Public instance

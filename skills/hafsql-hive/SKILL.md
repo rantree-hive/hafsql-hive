@@ -6,8 +6,9 @@ description: >
   operation type (especially the virtual-op trap), the rshares/vote-value
   formula, VESTS-to-HP conversion, milli-VESTS scaling, time-range filtering
   with id_from_timestamp, production pool setup with circuit breaker,
-  operation timeline cursor pagination, haf_operations body wrapping, and
-  Hive API response parsing patterns.
+  operation timeline cursor pagination, haf_operations body wrapping, comment
+  edit dedup, DHF proposal payouts, hivemind community joins, index-aware
+  query patterns for dashboards, and Hive API response parsing patterns.
   Trigger whenever writing backend code that queries HafSQL or calls
   condenser_api / rc_api for a Hive application.
 ---
@@ -84,6 +85,10 @@ HafSQL has three layers. Always prefer the **dedicated operation tables** (layer
 
 **Op type name format:** `haf_operation_types.name` is prefixed with `hive::protocol::` (e.g. `hive::protocol::vote_operation`). Strip for display: `.replace(/^hive::protocol::/, '')`. Filter with the full prefixed name. Skip `hive::protocol::effective_comment_vote_operation` — it is noisy and fires on every vote.
 
+**Op type registries:** use `hafsql.haf_operation_types` (or `hafd.operation_types`).
+There is **no `hafsql.operation_types`** — a query against it errors, and if it is
+wrapped in try/catch it fails silently.
+
 ### Layer 2 — dedicated operation tables (fast, correct)
 
 Use these instead of JSONB body parsing via `haf_operations`:
@@ -100,7 +105,14 @@ Use these instead of JSONB body parsing via `haf_operations`:
 | `hafsql.operation_fill_vesting_withdraw_table` | `from_account` / `to_account` | `withdrawn`, `deposited` |
 | `hafsql.operation_delegate_vesting_shares_table` | `delegator` / `delegatee` | `vesting_shares` |
 | `hafsql.operation_transfer_to_vesting_table` | `from_account` / `to_account` | `amount` |
-| `hafsql.operation_custom_json_view` | join via `hafd.account_operations` | `custom_id`, `payload` bytes → `hafsql.to_json(payload)` |
+| `hafsql.operation_custom_json_view` | `custom_id`; per-account via `hafd.account_operations` (§12) | `json` (**text**, not `payload`) → `hafsql.to_json(json)`, `required_auths`, `required_posting_auths` (JSONB) |
+| `hafsql.operation_proposal_pay_table` | `receiver`, `proposal_id` | `payment`, `symbol`, `payer` — DHF payouts, **virtual op** (§17) |
+| `hafsql.operation_withdraw_vesting_table` | `account` | `vesting_shares` (milli-VESTS), `symbol` — power-down *starts*; **no timestamp column** (use `get_timestamp(id)`); `vesting_shares = 0` rows are cancellations |
+| `hafsql.operation_transfer_to_savings_table` | `from_account` / `to_account` | `amount`, `symbol`, `memo` |
+| `hafsql.operation_effective_comment_vote_view` | `voter` / `author` | `rshares`, `vote_value`, `pending_payout` — virtual op fired per vote with the realised rshares |
+
+> `operation_comment_view` has **one row per edit** — see §16 before counting or
+> reading bodies from it.
 
 ### Rich account / global views
 
@@ -109,11 +121,14 @@ Use these instead of JSONB body parsing via `haf_operations`:
 | `hafsql.accounts` | Per-account HP, delegation totals, reputation, last activity, keys (`creator`, `recovery`). **VESTS columns are milli-VESTS — see §11.** |
 | `hafsql.balances` | Current HIVE / HBD / VESTS / hp_equivalent per account. `account_name` is the join key. **`vests` column is milli-VESTS — see §11.** |
 | `hafsql.dynamic_global_properties` | Chain globals incl. `vests_per_hive` direct ratio, `total_vesting_fund_hive`, `total_vesting_shares` |
-| `hafsql.reputations` | `rep` (display score), raw `reputation`, `account_name` |
+| `hafsql.reputations` | `rep` (**already display-scale** — no `rawRepToDisplay` needed), raw `reputation`, `account_name` |
 | `hafsql.delegations` | Active delegations with HP equivalent |
+| `hafsql.rc_delegations` | `delegator`, `delegatee`, `rc`, `hp_equivalent` |
+| `hafsql.proposal_approvals` | `proposal_id`, `voter` — current DHF proposal votes |
 | `hafsql.comments` | All authored content (root posts **and** replies). `parent_author = ''` → root posts only. Payout columns are "N.NNN HBD" strings — see §14. |
-| `hivemind_app.hive_accounts_info_view` | `followers`, `following`, `reputation`, `posting_json_metadata`, `post_count` (all authored content, not just root posts) |
-| `hivemind_app.hive_votes_view` | Per-vote rshares: `voter`, `author`, `permlink`, `rshares` — use for vote-value computation from actual rshares |
+| `hivemind_app.hive_accounts_info_view` | `followers`, `following`, `reputation`, `posting_json_metadata`, `post_count` (all authored content, not just root posts), `created_at` (filter for new accounts in a date range) |
+| `hivemind_app.hive_votes_view` | Per-vote rshares: `voter`, `author`, `permlink`, `rshares`, `percent`, `weight`, `is_effective`, `num_changes` — use for vote-value computation from actual rshares |
+| `hivemind_app.hive_posts` + `hive_permlink_data` + `hive_category_data` | Post → community/category resolution (§18) |
 
 ### HafSQL utility functions
 
@@ -121,7 +136,7 @@ Use these instead of JSONB body parsing via `haf_operations`:
 |----------|---------|---------|
 | `hafsql.id_from_timestamp(ts, round_up)` | operation id | time-range lower bound in WHERE (§3) |
 | `hafsql.get_timestamp(id)` | timestamptz | recover a human timestamp from an op id |
-| `hafsql.to_json(payload)` | JSONB | parse custom_json payload bytes to JSONB for field extraction |
+| `hafsql.to_json(json)` | JSONB | parse the custom_json `json` text column to JSONB for field extraction |
 
 ```sql
 -- get_timestamp: convert op id back to date for grouping
@@ -130,11 +145,14 @@ FROM hafsql.operation_transfer_table
 WHERE ...
 GROUP BY 1 ORDER BY 1;
 
--- to_json: extract fields from custom_json payload
-SELECT (hafsql.to_json(payload))->>'subject' AS subject,
-       (hafsql.to_json(payload))->>'action'  AS action
+-- to_json: extract fields from custom_json (the column is `json`, type text)
+SELECT (hafsql.to_json(json))->>'subject' AS subject,
+       (hafsql.to_json(json))->>'action'  AS action
 FROM hafsql.operation_custom_json_view
-WHERE (hafsql.to_json(payload))->>'action' IN ('create', 'edit');
+WHERE custom_id = 'your-app-id'
+  AND id > hafsql.id_from_timestamp(NOW() AT TIME ZONE 'utc' - INTERVAL '30 days', true)
+  AND (hafsql.to_json(json))->>'action' IN ('create', 'edit');
+-- ❌ to_json(payload) — there is no `payload` column on this view
 ```
 
 ### `hafsql.operations` vs `hafsql.haf_operations`
@@ -574,8 +592,10 @@ This applies to any query that reads from `hafsql.haf_operations` or
 
 ## 14  `hafsql.comments` payout columns
 
-Payout columns in `hafsql.comments` are stored as `"N.NNN HBD"` strings, not
-plain numerics. Use `SPLIT_PART` to extract the number in SQL, or parse in JS:
+Payout columns in `hafsql.comments` have been observed returning `"N.NNN HBD"`
+strings in production, even though `information_schema` reports them as `numeric`
+(the type can differ between nodes/versions). A direct `::float` cast then fails.
+`SPLIT_PART(col::text, ' ', 1)::numeric` works for **both** forms — always use it:
 
 ```sql
 -- In SQL: extract numeric value with SPLIT_PART
@@ -713,7 +733,168 @@ module.exports = { query, cache };
 > without killing the connection for others.
 
 
-## 16  Pitfalls checklist
+## 16  Comment edits, stale bodies, and bounding `hafsql.comments` scans
+
+**Every edit is a new op.** `hafsql.operation_comment_view` holds one row per
+`comment_operation`, and editing a post or reply broadcasts another one with the
+same `author` + `permlink`. Counting rows overcounts, and reading `body` may give
+an old version. Deduplicate to the latest version with `DISTINCT ON`:
+
+```sql
+SELECT DISTINCT ON (c.permlink)
+  c.author, c.permlink, c.parent_author, c.parent_permlink, c.json_metadata,
+  hafsql.get_timestamp(c.id) AS created_at        -- timestamp of the latest edit
+FROM hafsql.operation_comment_view c
+WHERE c.author = $1
+  AND c.parent_author != ''                       -- replies only
+  AND c.id > hafsql.id_from_timestamp(NOW() AT TIME ZONE 'utc' - INTERVAL '90 days', true)
+ORDER BY c.permlink, c.id DESC                    -- DESC → newest version wins
+LIMIT 15000
+```
+
+Fetch bodies separately for only the subset you need (`LEFT(body, 500)` keeps rows small).
+
+**`hafsql.comments.body` can be stale** for very recent content: it may still
+hold the original body before the author edited it. When an edit matters (e.g.
+detecting a mention added after posting), re-fetch the latest body from a Hive
+API node (`condenser_api.get_content`) for recent posts with no match in HafSQL.
+
+**Bound `hafsql.comments` by `created`.** `comments.id` is not an op id, so
+`id_from_timestamp` does not apply. Filter on `created` (and `author`) instead,
+and always add an upper age bound for multi-account lookups:
+
+```sql
+SELECT author, MAX(created) AS last_post
+FROM hafsql.comments
+WHERE author = ANY($1::text[])
+  AND created > NOW() - INTERVAL '3 years'       -- avoids a full scan for inactive accounts
+GROUP BY author
+```
+
+
+## 17  DHF payouts — `operation_proposal_pay_table`
+
+Hive Decentralized Fund (DHF / proposal) payouts are **virtual ops**, not
+transfers. They never appear in `operation_transfer_table` or `haf_operations`.
+
+```sql
+SELECT
+  payment::float                        AS amount,
+  proposal_id,
+  hafsql.get_timestamp(id)              AS ts,
+  hafsql.get_timestamp(MIN(id) OVER())  AS first_inflow,
+  COUNT(*) OVER()                       AS total_payment_count,
+  SUM(payment) OVER()::float            AS total_received_all
+FROM hafsql.operation_proposal_pay_table
+WHERE payer = 'hive.fund'
+  AND receiver = $1
+  AND symbol = 'HBD'
+  AND proposal_id != 0         -- proposal 0 is the Return Proposal (funds back to the DHF)
+ORDER BY id DESC
+LIMIT 200
+```
+
+- No timestamp column: use `hafsql.get_timestamp(id)`.
+- Group by `proposal_id, receiver`, not just `receiver`: one account can run several proposals.
+- Current proposal votes are in `hafsql.proposal_approvals`; live proposal state
+  (daily_pay, funded vs. unfunded) comes from `condenser_api.list_proposals`. Proposals
+  ranked below the Return Proposal's vote total receive nothing.
+
+
+## 18  Community / category of a post — hivemind join
+
+`hafsql.comments.category` gives the root post's main tag or community, but for
+data from `operation_comment_view` (or to classify replies by the community of
+their root post), join through hivemind:
+
+```sql
+SELECT b.*, hcd.category
+FROM base b                                         -- e.g. the DISTINCT ON CTE from §16
+JOIN hivemind_app.hive_accounts      ha  ON ha.name        = b.author
+JOIN hivemind_app.hive_permlink_data hpd ON hpd.permlink   = b.permlink
+JOIN hivemind_app.hive_posts         hp  ON hp.author_id   = ha.id
+                                        AND hp.permlink_id = hpd.id
+LEFT JOIN hivemind_app.hive_category_data hcd ON hcd.id    = hp.category_id
+```
+
+**Microblog / snap detection:** classify by community id, not by `parent_permlink`
+patterns. Replies to another user's snap carry a random permlink with no marker.
+
+| Community | Platform |
+|-----------|----------|
+| `hive-124838` | PeakSnaps / Snapie |
+| `hive-125125` | Ecency Waves |
+| `hive-115814` | Sportsbites |
+| `hive-167922` | LeoFinance (mixed blog and threads, so detect LeoThreads by `json_metadata.app` starting with `leothreads` or by `parent_author`) |
+
+
+## 19  Index cheat-sheet — write queries that hit these
+
+| Table | Useful indexes | Implication |
+|-------|---------------|-------------|
+| `operation_transfer_table` | `(from_account, id)`, `(to_account, id)`, `(memo, id)`, `(amount)` | Always filter on an account **or** memo, plus `id >` a bound. Memo lookups (deposit IDs) are indexed |
+| `operation_vote_view` | `(voter, id)`, `(author, id)` | One voter per query (§3 parallel scan) |
+| `operation_*_table` (most) | `(<account col>)`, unique `(id)` | Account filter first, `id_from_timestamp` for time |
+| `operation_proposal_pay_table` | `(receiver)`, `(proposal_id)` | |
+| `hafd.account_operations` | unique `(account_id, account_op_seq_no)`, `(account_id, op_type_id)` | Cursor pagination (§12); per-account op-type scans |
+| `hafd.operations` | partial on `body_value->>'author'` (+ `permlink`) for `op_type_id IN (0, 1, 72)` | Author/permlink lookups on vote (0), comment (1), and effective_comment_vote (72) are indexed. Other body fields are not |
+| `hafd.operation_types` | unique `(name)` | |
+
+A filter on an unindexed column (e.g. `memo LIKE '%x%'`, `amount::text`, JSONB
+fields other than the above) over a wide id range will time out on the public node.
+
+
+## 20  Query patterns for multi-account and dashboard work
+
+### Full-history totals + a limited page in one query
+
+Window functions are evaluated **before** `LIMIT`, so `SUM(...) OVER()` returns the
+total over all matching rows while only N rows are returned (see the §17 query).
+That saves a separate `COUNT/SUM` query.
+
+### Per-account time bounds with parallel `unnest`
+
+When each account needs its own window (e.g. "first 90 days after account
+creation"), pass parallel arrays and join on them:
+
+```sql
+SELECT c.author, LEFT(c.body, 20000) AS body, c.created AS ts
+FROM (SELECT unnest($1::text[])        AS author,
+             unnest($2::timestamptz[]) AS account_created) accs
+JOIN hafsql.comments c ON c.author = accs.author
+WHERE c.parent_author = ''
+  AND c.created >= accs.account_created
+  AND c.created <= accs.account_created + ($3 || ' days')::interval
+ORDER BY c.author, c.created ASC
+```
+
+For thousands of accounts, run it in **chunks of ~1000**, drop row references after
+each chunk (`rows = null`), and `await new Promise(r => setImmediate(r))` between
+chunks so V8 can garbage-collect. Without this, long scans run out of memory.
+
+### Sub-accounts and memo matching
+
+Include dot sub-accounts with `(from_account = $1 OR from_account LIKE $1 || '.%')`.
+When matching exchange deposit memos, drop memos that aren't deposit IDs:
+
+```sql
+AND (length(trim(memo)) >= 8 OR trim(memo) ~ '^[0-9]{5,}$')   -- long or numeric deposit IDs
+AND trim(memo) NOT LIKE '#%'                                    -- encrypted memos
+AND NOT (trim(memo) ~ '^[a-z][a-z0-9.-]{2,19}$')                -- username-like memos
+```
+
+### Finding new accounts in a period
+
+```sql
+SELECT name, created_at, post_count, reputation
+FROM hivemind_app.hive_accounts_info_view
+WHERE created_at >= $1::timestamp AND created_at < $2::timestamp
+  AND post_count > 0
+ORDER BY created_at DESC
+```
+
+
+## 21  Pitfalls checklist
 
 | Pitfall | Symptom | Fix |
 |---------|---------|-----|
@@ -733,3 +914,12 @@ module.exports = { query, cache };
 | `pending_payout_value` / `total_payout_value` cast directly to float | Cast fails (string "1.234 HBD") | Use `SPLIT_PART(col::text, ' ', 1)::numeric` in SQL (§14) |
 | Combined `WHERE voter = ANY($1)` over many voters | Slow bitmap scan; times out for wide windows | One query per voter in parallel (§3 — per-voter parallel scan) |
 | Querying `operation_comment_reward_table` with a 7-day window | Returns payouts for posts from 2 weeks ago, misses this week's | Use 30-day window (§2) |
+| `hafsql.to_json(payload)` on `operation_custom_json_view` | `column "payload" does not exist` | The column is `json` (text): `hafsql.to_json(json)` (§1) |
+| Querying `hafsql.operation_types` | `relation does not exist` (silent if caught) | Use `hafsql.haf_operation_types` / `hafd.operation_types` with the `hive::protocol::` prefix (§1) |
+| Counting rows in `operation_comment_view` | Edited posts counted 2+ times; old body text | `DISTINCT ON (permlink) … ORDER BY permlink, id DESC` (§16) |
+| Trusting `hafsql.comments.body` for just-edited posts | Text added in an edit is missing | Re-fetch recent bodies from the Hive API (§16) |
+| Looking for DHF payouts in transfers | 0 rows. Proposal pay is a virtual op | `operation_proposal_pay_table`, `payer='hive.fund'`, `proposal_id != 0` (§17) |
+| Detecting snaps by `parent_permlink` pattern | Misses replies to other users' snaps | Classify by community id via the hivemind join (§18) |
+| `hafsql.comments` lookup with no `created` bound | Full scan / timeout for inactive accounts | Add `created > NOW() - INTERVAL 'N'` (§16) |
+| Applying `rawRepToDisplay` to `hafsql.reputations.rep` | Nonsense reputation | `rep` is already display-scale. Convert only the raw `reputation` (§1) |
+| Big multi-account scan in a single query/array | Node heap OOM | Chunk ~1000 accounts, null rows, `setImmediate` between chunks (§20) |
