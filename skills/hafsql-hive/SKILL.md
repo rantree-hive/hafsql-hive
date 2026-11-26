@@ -3,8 +3,8 @@ name: hafsql-hive
 description: >
   Build correct, performant queries against HafSQL — the PostgreSQL layer over
   HAF-indexed Hive blockchain data. Covers which tables to query for each
-  operation type (especially the virtual-op trap), the rshares/vote-value
-  formula, VESTS-to-HP conversion, milli-VESTS scaling, time-range filtering
+  operation type, the rshares/vote-value formula, VESTS-to-HP conversion
+  (vests_per_hive is per-block and VESTS-per-HIVE), time-range filtering
   with id_from_timestamp, production pool setup with circuit breaker,
   operation timeline cursor pagination, haf_operations body wrapping, comment
   edit dedup, DHF proposal payouts, hivemind community joins, index-aware
@@ -77,11 +77,10 @@ HafSQL has three layers. Always prefer the **dedicated operation tables** (layer
 | View | Use for |
 |------|---------|
 | `hafsql.haf_account_operations` | Account–op index with account_name (`account_id`, `account_name`, `operation_id`) |
-| `hafsql.haf_operations` | Raw non-virtual ops (`id`, `op_type_id`, `timestamp`, `body` JSONB) |
+| `hafsql.haf_operations` | All ops, **real and virtual** (`id`, `op_type_id`, `timestamp`, `body` JSONB as `{type, value}`) — a view over `hafd.operations` |
 | `hafsql.haf_operation_types` | Op type registry (`id`, `name`, `is_virtual`) |
-| `hafsql.operations` | **Combined** view — real + virtual ops (use when you need to find virtual-op ids) |
 
-**Critical rule:** `haf_operations` does **not** contain virtual operations (author rewards, curation rewards, beneficiary rewards, fill-vesting-withdraw, etc.). Joining through it to find those types returns zero rows silently.
+**`haf_operations` includes virtual operations** (author/curation/benefactor rewards, producer_reward, fill_vesting_withdraw, proposal_pay, …) — verified 2026-11: the same 76 `author_reward` ops in one hour as `operation_author_reward_table`. There is **no `hafsql.operations` view**. Still prefer the layer-2 tables below: they are indexed by account and have typed columns, while filtering `haf_operations` by JSONB body fields is slow.
 
 **Op type name format:** `haf_operation_types.name` is prefixed with `hive::protocol::` (e.g. `hive::protocol::vote_operation`). Strip for display: `.replace(/^hive::protocol::/, '')`. Filter with the full prefixed name. Skip `hive::protocol::effective_comment_vote_operation` — it is noisy and fires on every vote.
 
@@ -91,7 +90,7 @@ wrapped in try/catch it fails silently.
 
 ### Layer 2 — dedicated operation tables (fast, correct)
 
-Use these instead of JSONB body parsing via `haf_operations`:
+Use these instead of JSONB body parsing via `haf_operations` (faster, typed, account-indexed):
 
 | Table | Filter column | Key value columns |
 |-------|--------------|-------------------|
@@ -107,7 +106,7 @@ Use these instead of JSONB body parsing via `haf_operations`:
 | `hafsql.operation_transfer_to_vesting_table` | `from_account` / `to_account` | `amount` |
 | `hafsql.operation_custom_json_view` | `custom_id`; per-account via `hafd.account_operations` (§12) | `json` (**text**, not `payload`) → `hafsql.to_json(json)`, `required_auths`, `required_posting_auths` (JSONB) |
 | `hafsql.operation_proposal_pay_table` | `receiver`, `proposal_id` | `payment`, `symbol`, `payer` — DHF payouts, **virtual op** (§17) |
-| `hafsql.operation_withdraw_vesting_table` | `account` | `vesting_shares` (milli-VESTS), `symbol` — power-down *starts*; **no timestamp column** (use `get_timestamp(id)`); `vesting_shares = 0` rows are cancellations |
+| `hafsql.operation_withdraw_vesting_table` | `account` | `vesting_shares` (VESTS), `symbol` — power-down *starts*; **no timestamp column** (use `get_timestamp(id)`); `vesting_shares = 0` rows are cancellations |
 | `hafsql.operation_transfer_to_savings_table` | `from_account` / `to_account` | `amount`, `symbol`, `memo` |
 | `hafsql.operation_effective_comment_vote_view` | `voter` / `author` | `rshares`, `vote_value`, `pending_payout` — virtual op fired per vote with the realised rshares |
 
@@ -118,14 +117,14 @@ Use these instead of JSONB body parsing via `haf_operations`:
 
 | View | Purpose |
 |------|---------|
-| `hafsql.accounts` | Per-account HP, delegation totals, reputation, last activity, keys (`creator`, `recovery`). **VESTS columns are milli-VESTS — see §11.** |
-| `hafsql.balances` | Current HIVE / HBD / VESTS / hp_equivalent per account. `account_name` is the join key. **`vests` column is milli-VESTS — see §11.** |
-| `hafsql.dynamic_global_properties` | Chain globals incl. `vests_per_hive` direct ratio, `total_vesting_fund_hive`, `total_vesting_shares` |
+| `hafsql.accounts` | Per-account HP, delegation totals, reputation, last activity, keys (`creator`, `recovery`). VESTS columns are whole VESTS, `*_hp` columns are HP (§11). |
+| `hafsql.balances` | Current HIVE / HBD / VESTS / hp_equivalent per account. `account_name` is the join key. `vests` is whole VESTS (§11). |
+| `hafsql.dynamic_global_properties` | **One row per block** (view over `hafd.blocks`). Always `ORDER BY block_num DESC LIMIT 1`. `vests_per_hive` = VESTS per HIVE; `total_*` columns are raw integer units (§4) |
 | `hafsql.reputations` | `rep` (**already display-scale** — no `rawRepToDisplay` needed), raw `reputation`, `account_name` |
 | `hafsql.delegations` | Active delegations with HP equivalent |
 | `hafsql.rc_delegations` | `delegator`, `delegatee`, `rc`, `hp_equivalent` |
 | `hafsql.proposal_approvals` | `proposal_id`, `voter` — current DHF proposal votes |
-| `hafsql.comments` | All authored content (root posts **and** replies). `parent_author = ''` → root posts only. Payout columns are "N.NNN HBD" strings — see §14. |
+| `hafsql.comments` | All authored content (root posts **and** replies). `parent_author = ''` → root posts only. Also `last_edited`, `deleted`, `beneficiaries`, `root_author`/`root_permlink`. Payout columns: see §14. |
 | `hivemind_app.hive_accounts_info_view` | `followers`, `following`, `reputation`, `posting_json_metadata`, `post_count` (all authored content, not just root posts), `created_at` (filter for new accounts in a date range) |
 | `hivemind_app.hive_votes_view` | Per-vote rshares: `voter`, `author`, `permlink`, `rshares`, `percent`, `weight`, `is_effective`, `num_changes` — use for vote-value computation from actual rshares |
 | `hivemind_app.hive_posts` + `hive_permlink_data` + `hive_category_data` | Post → community/category resolution (§18) |
@@ -154,13 +153,6 @@ WHERE custom_id = 'your-app-id'
   AND (hafsql.to_json(json))->>'action' IN ('create', 'edit');
 -- ❌ to_json(payload) — there is no `payload` column on this view
 ```
-
-### `hafsql.operations` vs `hafsql.haf_operations`
-
-`hafsql.operations` (no prefix) is the **combined** view that includes both real
-and virtual operations. `hafsql.haf_operations` excludes virtual ops.
-Use `hafsql.operations` when you need to find virtual-op ids
-(e.g., linking fill_vesting_withdraw_table rows to their op ids).
 
 
 ## 2  Reward op timing trap — `operation_comment_reward_table`
@@ -240,55 +232,82 @@ const rows = (await Promise.all(
 
 ## 4  VESTS → HP conversion
 
+`hafsql.dynamic_global_properties` is a view over `hafd.blocks`: **one row per
+block** (~100 M rows). Two traps:
+
 ```sql
--- From HafSQL (preferred — no API call)
-SELECT vests_per_hive FROM hafsql.dynamic_global_properties LIMIT 1;
--- hp = vests * vests_per_hive  (direct ratio, no division)
+-- ✅ Current ratio (fast — block_num is the primary key)
+SELECT vests_per_hive FROM hafsql.dynamic_global_properties
+ORDER BY block_num DESC LIMIT 1;
+
+-- ❌ LIMIT 1 without ORDER BY returns an arbitrary, possibly years-old block
+--    (observed 2026-11: a 2025-08 row, ratio ~4 % off)
+-- ❌ Never join/cross-join this view without that ORDER BY … LIMIT 1 subquery —
+--    it multiplies your result by every block in history
 ```
 
-Or fetch from `condenser_api.get_dynamic_global_properties` and compute:
+`vests_per_hive` is **VESTS per HIVE** (~1600), so **divide**:
+
 ```js
-const vestsToHp = totalFundHive / totalVestShares;
-// where both values come from parseAmt() — see §7
+const hp = vests / vestsPerHive;   // ✅  e.g. 174 110 743 VESTS / 1601.33 = 108 728 HP
+// ❌ vests * vestsPerHive — 2.5 million times too big
 ```
 
-`hafsql.balances.hp_equivalent` already stores the HP value directly for
-the current state; `hafsql.accounts.incoming_hp` / `outgoing_hp` do too.
+The raw `total_vesting_fund_hive` / `total_vesting_shares` columns are **integer
+chain units** (milli-HIVE ×1e3 and micro-VESTS ×1e6). Dividing them directly gives
+a HIVE-per-VEST ratio **1000× too small**:
 
-> **Important:** `hafsql.balances.vests`, `hafsql.accounts.incoming_vests`, and
-> `hafsql.accounts.outgoing_vests` are stored in **milli-VESTS** (÷1000 of whole VESTS).
-> Multiply by 1000 before the VESTS→HP conversion. See §11 for details.
+```js
+const hivePerVest = (row.total_vesting_fund_hive / 1e3) / (row.total_vesting_shares / 1e6);
+// or simply: 1 / row.vests_per_hive
+```
+
+From the Hive API instead (`condenser_api.get_dynamic_global_properties`):
+```js
+const hivePerVest = parseAmt(g.total_vesting_fund_hive) / parseAmt(g.total_vesting_shares); // see §7
+```
+
+`hafsql.balances.hp_equivalent` and `hafsql.accounts.incoming_hp` / `outgoing_hp`
+are already HP — HafSQL computes them with the latest block's ratio.
 
 
 ## 5  Vote value formula (rshares scale)
 
 ```js
-// Correct — matches Hive's internal rshares scale (empirically verified 2026-11)
-const voteHive100 = (effectiveVests * 1_000_000 / 25) / recentClaims
-                    * rewardBalance * 0.5;
+// Value of one 100 % weight vote at 100 % voting power (verified against peakd, 2026-11)
+const rshares100   = effectiveVests * 1_000_000 * 0.02;   // = effectiveVests * 20_000
+const voteHive100  = rshares100 / recentClaims * rewardBalance;
 const voteValue100Usd = voteHive100 * hivePrice;
 ```
 
 - `effectiveVests` = `vesting_shares - delegated_vesting_shares + received_vesting_shares` (raw VESTS from `condenser_api`)
 - `recentClaims` = `parseFloat(fund.recent_claims)` from `condenser_api.get_reward_fund`
 - `rewardBalance` = `parseAmt(fund.reward_balance)` (see §7)
-- `0.5` = 50 % author share post-HF21
-- The factor `1_000_000 / 25 = 40_000` is the correct rshares-per-VEST scale constant as of HAFAH. `recent_claims` accumulates in those same units.
+- `hivePrice` = median feed price (`get_current_median_history_price`: `base / quote`, HBD per HIVE)
 
-**Derivation:** At 100 % VP/weight, back-solving from peakd's displayed vote value:
-`factor = target_HBD × recentClaims / (effectiveVests × rewardBalance × HBD_per_HIVE × 0.5) ≈ 40 000`
+**Why these constants:**
+- `1_000_000`: rshares are computed from VESTS in their integer "satoshi" form.
+  VESTS have 6 decimal places, so 1 VEST = 1 000 000 units.
+- `0.02`: a 100 % vote spends **2 % of the voter's voting mana** (`used_mana = current_mana × weight / 10000 / 50`).
+  rshares come from the mana spent, not from the whole stake.
+- The result is the vote's **full** contribution to the post's payout. This is what peakd shows.
+  At payout it is split 50/50 between author and curators (post-HF21), and beneficiaries come out of the author half.
 
-**Common wrong factors and their symptoms:**
+> Older versions of this skill wrote this as `* 1_000_000 / 25 * 0.5` and called the `0.5` the "author share".
+> `/25 × 0.5` is the same number as `× 0.02`, so the values were right but the explanation was wrong.
+> If you want the author-side value specifically, multiply the result by `0.5`.
 
-| Factor | Code expression | Symptom |
-|--------|----------------|---------|
-| `1_000_000 / 25 = 40_000` | ✅ correct | matches peakd reference |
-| `1_000_000 / 100 = 10_000` | 4× too small | shows ¼ of real value |
-| `1_000_000 / 200 = 5_000` | 8× too small | shows ⅛ of real value |
-| `1` (factor omitted) | 40 000× too small | rounds to `$0.0000` |
+**Common wrong formulas and their symptoms:**
+
+| Expression for `rshares100` | Symptom |
+|-----------------------------|---------|
+| `effectiveVests * 1e6 * 0.02` | ✅ correct, matches peakd |
+| `effectiveVests * 1e6` (mana fraction omitted) | **50× too large** |
+| `effectiveVests * 1e6 * 0.02 * 0.5` | ½ of the displayed value (author share only) |
+| `effectiveVests` (1e6 omitted) | 1 000 000× too small, rounds to `$0.0000` |
 
 `voteValue100Usd` is the dollar value of one **100 % weight, 100 % VP** vote.
-Scale to other VP levels: `voteValue100Usd * (vpPercent / 100)`.
+Scale linearly: `voteValue100Usd * (vpPercent / 100) * (weight / 10000)`.
 
 > The ◆ symbol in peakd's vote value UI is **HBD** (≈ $1 each), not HIVE.
 > 0.234 ◆ means $0.234, not $0.234 × hivePrice.
@@ -300,9 +319,12 @@ from `hivemind_app.hive_votes_view` and convert directly:
 
 ```js
 // rs = row.rshares from hive_votes_view (BigInt from DB — coerce with Number())
+// The rshares already include the 2 % mana fraction, so don't apply 0.02 again.
 const vote_usd = Math.round(
-  (Math.abs(rs) / recentClaims) * rewardBalance * 0.5 * hivePrice * 10000
+  (Math.abs(rs) / recentClaims) * rewardBalance * hivePrice * 10000
 ) / 10000 * Math.sign(rs);
+// Full vote value, consistent with voteValue100Usd above.
+// Multiply by 0.5 for the author-side share only.
 ```
 
 Batch lookup for a page of vote_operations:
@@ -480,79 +502,79 @@ WHERE author = $1
 overcount for accounts that comment frequently.
 
 
-## 11  milli-VESTS scaling — `hafsql.accounts` and `hafsql.balances`
+## 11  VESTS units in HafSQL views — all whole VESTS
 
-`hafsql.balances.vests`, `hafsql.accounts.incoming_vests`, and
-`hafsql.accounts.outgoing_vests` store VESTS in **milli-VESTS** (1/1000 of a whole
-VEST). Always multiply by 1000 before the vestsToHp conversion.
+Every VESTS column in the `hafsql` views and operation tables is in **whole VESTS**
+(the views already divide the chain's micro-VESTS by 1 000 000). Verified 2026-11
+against the view definitions and data:
 
-```js
-const VESTS_SCALE = 1000;
-
-// From hafsql.balances
-const ownVests  = parseAmt(dbRow.vests)          * VESTS_SCALE;
-const delVests  = parseAmt(dbRow.outgoing_vests)  * VESTS_SCALE;
-const recVests  = parseAmt(dbRow.incoming_vests)  * VESTS_SCALE;
-const effectiveVests = ownVests - delVests + recVests;
-
-const vestsToHp = totalVestShares > 0 ? totalFundHive / totalVestShares : 0;
-const hp = Math.round(effectiveVests * vestsToHp);
-```
-
-The same scale factor applies when converting `vesting_payout` from the reward
-tables (operation_author_reward_table etc.):
+| Column | Unit |
+|--------|------|
+| `hafsql.balances.vests` | VESTS |
+| `hafsql.accounts.incoming_vests` / `outgoing_vests` / `vesting_withdraw_rate` | VESTS |
+| `operation_*_reward_table.vesting_payout`, `operation_curation_reward_table.reward` | VESTS |
+| `operation_withdraw_vesting_table.vesting_shares` | VESTS |
+| `hafsql.dynamic_global_properties.total_vesting_shares` | **micro-VESTS (raw)** — the exception |
 
 ```js
-// vesting_payout from operation_*_table is also milli-VESTS
-const authorHp = Math.round(
-  parseFloat(ar.vests_all || 0) * VESTS_SCALE * vestsToHp * 1000
-) / 1000;
+const [{ vests_per_hive }] = await query(
+  `SELECT vests_per_hive FROM hafsql.dynamic_global_properties ORDER BY block_num DESC LIMIT 1`);
+const effectiveVests = +row.vests - +row.outgoing_vests + +row.incoming_vests;
+const hp = effectiveVests / +vests_per_hive;
 ```
 
-> `hafsql.accounts.incoming_hp`, `outgoing_hp`, and `balances.hp_equivalent` are
-> already in HP — no scaling needed. The raw VESTS columns are the ones that need it.
+> Older versions of this skill said these columns were **milli-VESTS** and multiplied
+> them by 1000. That only produced correct HP because the ratio was computed from the
+> raw `total_*` columns, which is 1000× too small (§4) — the two errors cancelled.
+> Fix both together if you are migrating code.
 
 
-## 12  Operation timeline — `haf_account_operations` cursor pagination
+## 12  Operation timeline — cursor pagination on `account_op_seq_no`
 
-For paginated operation history (e.g. "show account ops for a given day"):
+Paginate by `account_op_seq_no` alone, picking the page in a `MATERIALIZED` CTE so
+PostgreSQL walks the unique index `(account_id, account_op_seq_no)` backwards and
+joins only the 51 rows it keeps:
 
 ```sql
--- Paginated daily operation history
--- cursor is the account_op_seq_no from the last item of the previous page
-SELECT
-  o.id,
-  ao.account_op_seq_no AS seq_no,
-  o.timestamp,
-  ot.name        AS op_type,
-  ot.is_virtual,
-  o.body
-FROM hafsql.haf_account_operations ao
-JOIN hafsql.haf_operations o       ON ao.operation_id = o.id
-JOIN hafsql.haf_operation_types ot ON o.op_type_id    = ot.id
-WHERE ao.account_name = $1
-  AND ao.operation_id >= hafsql.id_from_timestamp($2::timestamptz, false)
-  AND ao.operation_id <= COALESCE(hafsql.id_from_timestamp($3::timestamptz, true),
-                                  9223372036854775807)
-  AND ot.name NOT IN ('hive::protocol::effective_comment_vote_operation')
-  AND ao.account_op_seq_no < $4   -- cursor: omit on first page
-ORDER BY ao.account_op_seq_no DESC
-LIMIT 51  -- fetch 51, hasMore = (rows.length === 51), serve rows.slice(0, 50)
+WITH page AS MATERIALIZED (
+  SELECT ao.account_op_seq_no, ao.operation_id
+  FROM hafd.account_operations ao
+  WHERE ao.account_id = (SELECT id FROM hafd.accounts WHERE name = $1)
+    AND ao.op_type_id <> 72                 -- effective_comment_vote: noisy, fires on every vote
+    AND ao.account_op_seq_no < $2           -- cursor: omit on first page
+  ORDER BY ao.account_op_seq_no DESC
+  LIMIT 51                                  -- hasMore = rows.length === 51; serve 50
+)
+SELECT p.account_op_seq_no AS seq_no, o.id, o.timestamp, ot.name AS op_type, ot.is_virtual, o.body
+FROM page p
+JOIN hafsql.haf_operations o       ON o.id  = p.operation_id
+JOIN hafsql.haf_operation_types ot ON ot.id = o.op_type_id
+ORDER BY p.account_op_seq_no DESC
 ```
 
 ```js
 const hasMore    = rows.length === 51;
 const ops        = rows.slice(0, 50);
 const nextCursor = hasMore ? ops[ops.length - 1].seq_no : null;
+// For a date range: keep paging until ops[ops.length-1].timestamp < rangeStart.
 ```
 
-The `account_op_seq_no` cursor is stable across queries and works correctly
-even when new ops arrive during pagination.
+> ❌ Do **not** bound this query with `ao.operation_id >= id_from_timestamp(...)`.
+> There is no index on `(account_id, operation_id)`, so it becomes a filter over the
+> account's entire history — 20 s+ timeouts for active accounts (verified 2026-11 on
+> an account with ~2 M ops). The seq_no version above runs in ~350 ms.
+
+The `account_op_seq_no` cursor is stable even when new ops arrive during pagination.
 
 ### Reading custom_json via account operation index (hafd layer 0)
 
 When you need custom_json ops for a specific account+custom_id from the full
-history (not just recent), join through `hafd.accounts` → `hafd.account_operations`:
+history (not just recent), join through `hafd.accounts` → `hafd.account_operations`.
+The `op_type_id = 18` filter matters: without it the join times out for active
+accounts; with it, ~1.7 s on the public node.
+
+> Built-in ids like `follow` and `reblog` carry a JSON **array**
+> (`["follow", {...}]`), so read fields with `->1->>'following'`, not `->>'following'`.
 
 ```sql
 WITH account_notes AS (
@@ -562,6 +584,7 @@ WITH account_notes AS (
     v.timestamp
   FROM hafd.accounts a
   JOIN hafd.account_operations ao ON ao.account_id = a.id
+                                 AND ao.op_type_id = 18   -- custom_json: uses the (account_id, op_type_id) index
   JOIN hafsql.operation_custom_json_view v ON v.id = ao.operation_id
   WHERE a.name = 'your-account'
     AND v.custom_id = 'your-app-id'
@@ -575,27 +598,31 @@ WHERE (hafsql.to_json(payload))->>'action' IN ('create', 'edit')
 ```
 
 
-## 13  `haf_operations.body` — HAFAH body wrapping
+## 13  `haf_operations.body` — always `{type, value}`
 
-On HAFAH nodes the `body` JSONB column of `haf_operations` may be wrapped in an
-extra `{ value: ... }` object. Always unwrap before accessing fields:
+The `hafsql.haf_operations` view builds `body` as
+`jsonb_build_object('type', <op name without prefix>, 'value', <op body>)`, so the
+operation fields are **always** one level down:
 
 ```js
-const body = row.body?.value ?? row.body;
-// ✅ body.voter, body.author, body.permlink — safe
-// ❌ row.body.voter — will be undefined on HAFAH
+const op = row.body.value;      // ✅ op.voter, op.author, op.permlink
+// ❌ row.body.voter — undefined
 ```
 
-This applies to any query that reads from `hafsql.haf_operations` or
-`hafsql.operations` and accesses JSONB body fields in JS.
+```sql
+SELECT body->'value'->>'voter' FROM hafsql.haf_operations WHERE ...
+```
+
+(`row.body?.value ?? row.body` is a safe pattern if the same code also handles
+op bodies from the Hive API, which are not wrapped this way.)
 
 
 ## 14  `hafsql.comments` payout columns
 
-Payout columns in `hafsql.comments` have been observed returning `"N.NNN HBD"`
-strings in production, even though `information_schema` reports them as `numeric`
-(the type can differ between nodes/versions). A direct `::float` cast then fails.
-`SPLIT_PART(col::text, ' ', 1)::numeric` works for **both** forms — always use it:
+On the current public node the payout columns in `hafsql.comments` are `numeric`
+(verified 2026-11). Older HafSQL versions returned `"N.NNN HBD"` strings, where a
+direct `::float` cast fails. If your code must run against several nodes,
+`SPLIT_PART(col::text, ' ', 1)::numeric` works for **both** forms:
 
 ```sql
 -- In SQL: extract numeric value with SPLIT_PART
@@ -774,8 +801,9 @@ GROUP BY author
 
 ## 17  DHF payouts — `operation_proposal_pay_table`
 
-Hive Decentralized Fund (DHF / proposal) payouts are **virtual ops**, not
-transfers. They never appear in `operation_transfer_table` or `haf_operations`.
+Hive Decentralized Fund (DHF / proposal) payouts are **virtual ops**
+(`proposal_pay_operation`), not transfers. They never appear in
+`operation_transfer_table`; use the dedicated table:
 
 ```sql
 SELECT
@@ -898,8 +926,11 @@ ORDER BY created_at DESC
 
 | Pitfall | Symptom | Fix |
 |---------|---------|-----|
-| Querying `haf_operations` for virtual ops | Returns 0 rows for reward ops | Use dedicated `operation_*` tables (§1) |
-| Wrong rshares factor in vote value | Vote values too small or `$0.00` | Use `* 1_000_000 / 25` (§5) |
+| Filtering `haf_operations` by JSONB body fields | Slow scans / timeouts | Use the typed, account-indexed `operation_*` tables (§1) |
+| `dynamic_global_properties … LIMIT 1` without `ORDER BY block_num DESC` | Stale ratio from an arbitrary old block | `ORDER BY block_num DESC LIMIT 1` (§4) |
+| Joining `dynamic_global_properties` without the LIMIT subquery | Result × 100 M rows; client OOM | Scalar subquery `(SELECT vests_per_hive … ORDER BY block_num DESC LIMIT 1)` (§4) |
+| `vests * vests_per_hive` | HP millions of times too big | `vests / vests_per_hive` — it is VESTS per HIVE (§4) |
+| Wrong rshares factor in vote value | Vote values 50× too large (no `0.02`) or `$0.00` (no `1e6`) | `rshares = effectiveVests * 1e6 * 0.02` (§5) |
 | `parseAmt` without precision division | HP shows correct (error cancels) but vote values are 1000× inflated | Use precision-aware parseAmt (§7) |
 | `rc_api.find_rc_accounts` params wrapped in array | `"Bad Cast: Invalid cast from array_type to Object"` | Pass plain object: `{ accounts: [u] }`, not `[{ accounts: [u] }]` |
 | RC/VP `current_mana` used raw | Shows stale low % that ignores time since last activity | Regenerate forward: `stored + elapsed * (max / regen_secs)` (§6) |
@@ -908,8 +939,10 @@ ORDER BY created_at DESC
 | `comments.id` used as op id | Wrong results on time-filter | `comments.id` is NOT an op id; filter by `created` timestamp |
 | Time-filtering via JS after big fetch | Slow, hits LIMIT before covering full range | Use `id_from_timestamp` in SQL WHERE (§3) |
 | `fmtUsd` (toFixed(2)) for vote values | Small values show as `$0.00` | Use `toFixed(4)` for vote table cells |
-| `balances.vests` / `accounts.incoming_vests` / `outgoing_vests` used raw for HP | HP is 1000× too small | These are milli-VESTS — multiply by 1000 before `× vestsToHp` (§11) |
-| `haf_operations.body.voter` (or any field) is undefined | HAFAH wraps body in `{ value: {...} }` | Use `row.body?.value ?? row.body` before accessing fields (§13) |
+| Ratio from raw `total_vesting_fund_hive / total_vesting_shares` | HP 1000× too small | Raw columns are ×1e3 / ×1e6 — use `1 / vests_per_hive` (§4, §11) |
+| `haf_operations.body.voter` (or any field) is undefined | The view wraps body as `{ type, value }` | Use `row.body.value` / `body->'value'` (§13) |
+| History page bounded by `operation_id >= id_from_timestamp(...)` | Timeout for active accounts | Page by `account_op_seq_no` in a MATERIALIZED CTE (§12) |
+| Account-index custom_json join without `op_type_id = 18` | Timeout | Add `ao.op_type_id = 18` (§12) |
 | Op type name without `hive::protocol::` prefix | `WHERE ot.name = 'vote_operation'` matches nothing | Full name is `hive::protocol::vote_operation`; strip for display only (§1) |
 | `pending_payout_value` / `total_payout_value` cast directly to float | Cast fails (string "1.234 HBD") | Use `SPLIT_PART(col::text, ' ', 1)::numeric` in SQL (§14) |
 | Combined `WHERE voter = ANY($1)` over many voters | Slow bitmap scan; times out for wide windows | One query per voter in parallel (§3 — per-voter parallel scan) |
