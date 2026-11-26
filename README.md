@@ -10,12 +10,12 @@ npx skills add rantree-hive/hafsql-hive
 
 ## What it covers
 
-- Which HafSQL table to use for each operation type — including the **virtual-op trap** (`haf_operations` silently returns 0 rows for reward ops)
+- Which HafSQL table to use for each operation type — typed, account-indexed `operation_*` tables vs. the generic `haf_operations` view (which includes virtual ops)
 - HafSQL utility functions: `id_from_timestamp`, `get_timestamp`, `to_json`
 - Multi-window aggregation with `id_from_timestamp` (30d / 7d / all-time in one query)
 - `operation_comment_reward_table` timing trap (fires at payout, not post creation — use 30d window)
-- VESTS → HP conversion via `hafsql.dynamic_global_properties.vests_per_hive`
-- Vote value / rshares formula — the **correct** `* 1_000_000 / 25` scaling factor (empirically verified 2026-11); common wrong factors and their symptoms
+- VESTS → HP conversion: `dynamic_global_properties` is **one row per block** (`ORDER BY block_num DESC LIMIT 1`), and `vests_per_hive` is VESTS per HIVE (divide, don't multiply)
+- Vote value / rshares formula: `effectiveVests × 1e6 × 0.02` (VESTS precision × the 2 % of mana a full vote spends), verified against peakd 2026-11; common wrong formulas and their symptoms
 - RC% calculation with mana regeneration forward-projection (raw `current_mana` is stale)
 - `rc_api.find_rc_accounts` correct params form: plain object, not array-wrapped
 - HAFAH broken fields: `reputation: 0`, `comment_count: 0` from `condenser_api.get_accounts` — correct sources
@@ -25,9 +25,9 @@ npx skills add rantree-hive/hafsql-hive
 - Schema layers: hafd layer-0 raw tables, generic views, dedicated op tables, and the `op_type` name format
 - Per-voter parallel scan for vote queries over many accounts (avoids slow bitmap scans on `voter = ANY(...)`)
 - Vote value from actual rshares via `hivemind_app.hive_votes_view`
-- **milli-VESTS scaling** in `hafsql.balances.vests` and `hafsql.accounts.incoming_vests` / `outgoing_vests`
-- Operation timeline with `haf_account_operations` cursor pagination, plus reading `custom_json` via the hafd account-operation index
-- `haf_operations.body` wrapping on HAFAH nodes (`body?.value`)
+- VESTS units: every `hafsql` VESTS column is whole VESTS; only the raw `total_*` globals are integer chain units
+- Operation timeline with fast `account_op_seq_no` cursor pagination (and the `operation_id` bound that times out), plus `custom_json` via the hafd account-operation index with `op_type_id = 18`
+- `haf_operations.body` is always `{type, value}`
 - `hafsql.comments` payout columns: `SPLIT_PART` string format, tags JSONB filter, active vs. paid-out detection, sub-account `LIKE` pattern
 - Production pool setup with circuit breaker, retry, and `statement_timeout`
 - Correct `custom_json` column (`json` text → `hafsql.to_json(json)`) and op-type registry names
